@@ -5,65 +5,83 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"time"
+	"sync"
 
-	"github.com/go-redis/redis/v8"
 	"github.com/julienschmidt/httprouter"
-	// "github.com/rs/cors"
+	"golang.org/x/time/rate"
 )
 
-var rdb *redis.Client
+// Create a map to hold the rate limiters for each visitor and a mutex.
+var visitors = make(map[string]*rate.Limiter)
+var mtx = sync.Mutex{}
 
-func main() {
-	// c := cors.New(cors.Options{
-	// 	AllowedOrigins:   []string{"http://localhost:3000"},
-	// 	AllowCredentials: true,
-	// })
-	rdb = redis.NewClient(&redis.Options{
-		Addr:     "some-redis:6379",
-		Password: "", // no password set
-		DB:       0,  // use default DB
-	})
-	// Ping Redis to make sure our connection is good
-	_, err := rdb.Ping(rdb.Context()).Result()
-	if err != nil {
-		log.Fatalf("Error connecting to Redis: %v", err)
-	}
+// Create a new rate limiter and add it to the visitors map, with the IP address as the key
+func addVisitor(ip string) *rate.Limiter {
+	limiter := rate.NewLimiter(1, 5) // limit to 1 request per second with a burst of 5
 
-	router := httprouter.New()
+	mtx.Lock()
+	visitors[ip] = limiter
+	mtx.Unlock()
 
-	// Assuming your actual API is defined in TARGET_URL environment variable
-	targetUrl := "http://localhost:3000"
-	url, _ := url.Parse(targetUrl)
-	proxy := httputil.NewSingleHostReverseProxy(url)
-
-	router.Handler("GET", "/api/*path", rateLimit(proxy))
-
-	log.Fatal(http.ListenAndServe(":8080", router))
+	return limiter
 }
 
-func rateLimit(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := r.RemoteAddr
+// Retrieve and return the rate limiter for the current visitor if it already exists.
+// Otherwise call the addVisitor function to add a new entry to the map.
+func getVisitor(ip string) *rate.Limiter {
+	mtx.Lock()
+	limiter, exists := visitors[ip]
+	mtx.Unlock()
 
-		// Check how many tokens the client has left
-		tokensLeft, _ := rdb.Get(r.Context(), key).Int()
+	if !exists {
+		return addVisitor(ip)
+	}
 
-		// If the client has no tokens left, reject the request
-		if tokensLeft <= 0 {
-			http.Error(w, "Rate limit exceeded.", http.StatusTooManyRequests)
+	return limiter
+}
+
+// Middleware function which will get the rate limiter for the current visitor and
+// reject the request if would exceed the rate limit.
+func rateLimit(next httprouter.Handle) httprouter.Handle {
+	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+		limiter := getVisitor(r.RemoteAddr)
+		if !limiter.Allow() {
+			http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
 			return
 		}
+		next(w, r, ps)
+	}
+}
 
-		// Decrement the token count for the client
-		rdb.Decr(r.Context(), key)
+func reverseProxy(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	// Create reverse proxy
+	url, err := url.Parse("http://localhost:3000/test")
+	if err != nil {
+		http.Error(w, "Error parsing proxy URL", http.StatusInternalServerError)
+		log.Printf("Error parsing proxy URL: %v", err)
+		return
+	}
+	proxy := httputil.NewSingleHostReverseProxy(url)
 
-		// If it's the client's first request, initialize the token count and set the expiration time
-		if tokensLeft == 0 {
-			rdb.Set(r.Context(), key, 100, time.Hour)
-		}
+	// Update the headers to allow for SSL redirection
+	r.URL.Host = url.Host
+	r.URL.Scheme = url.Scheme
+	r.Header.Set("X-Forwarded-Host", r.Header.Get("Host"))
+	r.Host = url.Host
 
-		// If the client has tokens left, forward the request to the target API
-		next.ServeHTTP(w, r)
-	})
+	// Note that ServeHttp is non blocking and uses a go routine under the hood
+	proxy.ServeHTTP(w, r)
+}
+
+func main() {
+	router := httprouter.New()
+
+	// Apply the rate limiter to the API redirect endpoint.
+	router.GET("/", rateLimit(reverseProxy))
+
+	log.Println("Server is starting...")
+	err := http.ListenAndServe(":8080", router)
+	if err != nil {
+		log.Fatalf("Could not start server: %v", err)
+	}
 }
